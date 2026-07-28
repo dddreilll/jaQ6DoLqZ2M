@@ -4,9 +4,10 @@ import 'dotenv/config';
 
 import { Logger } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
-import { MicroserviceOptions, Transport } from '@nestjs/microservices';
+import { MicroserviceOptions } from '@nestjs/microservices';
 import { AppModule } from './app.module';
 import { CDH_DLX, CDH_EXCHANGE } from './data-sync/data-sync.contracts';
+import { ResilientServerRMQ } from './data-sync/resilient-server-rmq';
 import { SyncMessageDeserializer } from './data-sync/sync-message.deserializer';
 
 async function bootstrap(): Promise<void> {
@@ -18,8 +19,7 @@ async function bootstrap(): Promise<void> {
   const app = await NestFactory.createMicroservice<MicroserviceOptions>(
     AppModule,
     {
-      transport: Transport.RMQ,
-      options: {
+      strategy: new ResilientServerRMQ({
         urls: [process.env.CDH_RABBITMQ_URL!],
         queue: `q.store.${storeCode}`,
         queueOptions: {
@@ -32,7 +32,7 @@ async function bootstrap(): Promise<void> {
         noAck: false, // manual ack — handlers ack/nack every message
         prefetchCount: 10,
         deserializer: new SyncMessageDeserializer(),
-      },
+      }),
     },
   );
   app.enableShutdownHooks();
