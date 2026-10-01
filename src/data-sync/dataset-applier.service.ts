@@ -8,6 +8,13 @@ import { LocalDatasetStore } from './local-dataset.store';
 
 export type ApplyOutcome = 'applied' | 'skipped';
 
+/** What the store holds after apply() — the version/hash its ack must report. */
+export interface ApplyResult {
+  outcome: ApplyOutcome;
+  version: number;
+  contentHash?: string;
+}
+
 /**
  * A PARTIAL arrived on the wrong base version. The controller nacks the message
  * (dead-letter) WITHOUT sending a FAILED ack — per the guide, gaps are
@@ -31,7 +38,7 @@ export class DatasetApplierService {
 
   constructor(private readonly store: LocalDatasetStore) {}
 
-  async apply(message: SyncMessage): Promise<ApplyOutcome> {
+  async apply(message: SyncMessage): Promise<ApplyResult> {
     const current = await this.store.read(message.datasetType);
     const appliedVersion = current?.version ?? 0;
 
@@ -40,7 +47,11 @@ export class DatasetApplierService {
       this.logger.log(
         `Skip ${message.datasetType} v${message.version} (already at v${appliedVersion})`,
       );
-      return 'skipped';
+      return {
+        outcome: 'skipped',
+        version: appliedVersion,
+        contentHash: current?.contentHash,
+      };
     }
 
     // Recommended integrity check: reject payloads that don't match the hash.
@@ -78,7 +89,11 @@ export class DatasetApplierService {
     this.logger.log(
       `Applied ${message.datasetType} v${message.version} (${message.mode})`,
     );
-    return 'applied';
+    return {
+      outcome: 'applied',
+      version: message.version,
+      contentHash: message.contentHash,
+    };
   }
 
   private mergePartial(currentRecords: unknown, message: SyncMessage): unknown {

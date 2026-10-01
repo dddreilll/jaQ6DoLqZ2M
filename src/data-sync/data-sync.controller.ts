@@ -55,11 +55,16 @@ export class DataSyncController {
     const channel = context.getChannelRef();
     const rawMessage = context.getMessage();
     try {
-      const outcome = await this.applier.apply(message);
+      const result = await this.applier.apply(message);
       channel.ack(rawMessage);
-      if (outcome === 'applied') {
-        await this.sendAck(message, 'APPLIED');
-      }
+      // A skip still sends APPLIED — head office may have missed the original
+      // ack. Report the version the store holds, never message.version: an
+      // older replay would otherwise move head office's applied version back.
+      await this.confirmApplied(
+        message.datasetType,
+        result.version,
+        result.contentHash,
+      );
     } catch (error) {
       channel.nack(rawMessage, false, false); // requeue=false → dead-letter exchange
       if (error instanceof DatasetGapError) {
@@ -71,29 +76,55 @@ export class DataSyncController {
       this.logger.error(
         `Failed to apply ${message.datasetType} v${message.version}: ${reason}`,
       );
-      await this.sendAck(message, 'FAILED', reason);
+      await this.sendAck(
+        message.datasetType,
+        message.version,
+        'FAILED',
+        message.contentHash,
+        reason,
+      );
+    }
+  }
+
+  /**
+   * APPLIED is sent after the message is already acked, so a publish failure
+   * must not fall into the FAILED path (that would nack an acked message and
+   * report a healthy store as failed). A lost ack is recoverable: the next
+   * redelivery of the same version re-confirms it via the skip path.
+   */
+  private async confirmApplied(
+    datasetType: string,
+    version: number,
+    contentHash?: string,
+  ): Promise<void> {
+    try {
+      await this.sendAck(datasetType, version, 'APPLIED', contentHash);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      this.logger.warn(
+        `Could not send APPLIED ack for ${datasetType} v${version}: ${reason}`,
+      );
     }
   }
 
   private async sendAck(
-    message: SyncMessage,
+    datasetType: string,
+    version: number,
     status: SyncAckStatus,
+    contentHash?: string,
     error?: string,
   ): Promise<void> {
     const ack: SyncAck = {
       storeCode: STORE_CODE,
-      datasetType: message.datasetType,
-      version: message.version,
+      datasetType,
+      version,
       status,
-      contentHash: message.contentHash,
+      ...(contentHash ? { contentHash } : {}),
       ...(error ? { error } : {}),
     };
     // emit() is a cold Observable — nothing is published until subscribed.
     await lastValueFrom(
-      this.ackClient.emit(
-        buildAckRoutingKey(message.datasetType, STORE_CODE),
-        ack,
-      ),
+      this.ackClient.emit(buildAckRoutingKey(datasetType, STORE_CODE), ack),
     );
   }
 }
