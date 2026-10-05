@@ -10,7 +10,12 @@ export const DATASYNC_ACK_CLIENT = 'DATASYNC_ACK_CLIENT';
 
 export type DatasetScope = 'GLOBAL' | 'STORE';
 export type SyncMode = 'SNAPSHOT' | 'PARTIAL';
-export type SyncAckStatus = 'APPLIED' | 'FAILED';
+/**
+ * APPLIED: applied this version. SKIPPED: already held it or a newer one (the
+ * ack carries the version held). FAILED: read it but couldn't apply it; the
+ * ack's `error` says why.
+ */
+export type SyncAckStatus = 'APPLIED' | 'SKIPPED' | 'FAILED';
 
 /** The versioned message every store receives. Raw JSON body — no Nest wrapper. */
 export interface SyncMessage<TPayload = unknown> {

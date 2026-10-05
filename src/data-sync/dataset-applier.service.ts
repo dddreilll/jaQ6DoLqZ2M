@@ -16,9 +16,9 @@ export interface ApplyResult {
 }
 
 /**
- * A PARTIAL arrived on the wrong base version. The controller nacks the message
- * (dead-letter) WITHOUT sending a FAILED ack — per the guide, gaps are
- * recovered with a fresh snapshot, not reported as apply failures.
+ * A PARTIAL arrived on the wrong base version. Never applied: the controller
+ * reports it as a FAILED ack with this message as the reason (then acks it),
+ * and head office recovers the store with a fresh snapshot.
  */
 export class DatasetGapError extends Error {
   constructor(datasetType: string, expectedBase: number | null, actual: number) {

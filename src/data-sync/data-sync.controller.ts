@@ -6,6 +6,7 @@ import {
   Payload,
   RmqContext,
 } from '@nestjs/microservices';
+import { Channel, Message } from 'amqplib';
 import { lastValueFrom } from 'rxjs';
 import {
   buildAckRoutingKey,
@@ -14,7 +15,11 @@ import {
   SyncAckStatus,
   SyncMessage,
 } from './data-sync.contracts';
-import { DatasetApplierService, DatasetGapError } from './dataset-applier.service';
+import {
+  ApplyResult,
+  DatasetApplierService,
+  DatasetGapError,
+} from './dataset-applier.service';
 
 // Decorator arguments are evaluated when this file is imported, so STORE_CODE
 // must already be in process.env — main.ts loads dotenv before anything else.
@@ -50,32 +55,54 @@ export class DataSyncController {
     return this.handle(message, context);
   }
 
-  // noAck: false — every path must end in exactly one ack or nack.
+  // noAck: false — every path must end in exactly one ack or nack. A message
+  // that reaches a handler was read, so it ends in ack, failures included;
+  // only the deserializer nacks (a message that can't be read at all).
   private async handle(message: SyncMessage, context: RmqContext) {
-    const channel = context.getChannelRef();
-    const rawMessage = context.getMessage();
+    const channel = context.getChannelRef() as Channel;
+    const rawMessage = context.getMessage() as Message;
+    let result: ApplyResult;
     try {
-      const result = await this.applier.apply(message);
-      channel.ack(rawMessage);
-      // A skip still sends APPLIED — head office may have missed the original
-      // ack. Report the version the store holds, never message.version: an
-      // older replay would otherwise move head office's applied version back.
-      await this.confirmApplied(
-        message.datasetType,
-        result.version,
-        result.contentHash,
-      );
+      result = await this.applier.apply(message);
     } catch (error) {
-      channel.nack(rawMessage, false, false); // requeue=false → dead-letter exchange
-      if (error instanceof DatasetGapError) {
-        // Gaps are recovered with a fresh snapshot, not reported as failures.
-        this.logger.warn(`${error.message} — request a snapshot from head office`);
-        return;
-      }
       const reason = error instanceof Error ? error.message : String(error);
-      this.logger.error(
-        `Failed to apply ${message.datasetType} v${message.version}: ${reason}`,
-      );
+      if (error instanceof DatasetGapError) {
+        // Head office shows the store as failed and resends a full snapshot.
+        this.logger.warn(`${reason} — reporting FAILED`);
+      } else {
+        this.logger.error(
+          `Failed to apply ${message.datasetType} v${message.version}: ${reason}`,
+        );
+      }
+      await this.reportFailure(message, reason, channel, rawMessage);
+      return;
+    }
+    channel.ack(rawMessage);
+    // A skip still confirms, as SKIPPED — head office may have missed the
+    // original ack. Report the version the store holds, never message.version:
+    // an older replay would otherwise move head office's applied version back.
+    await this.confirm(
+      message.datasetType,
+      result.outcome === 'skipped' ? 'SKIPPED' : 'APPLIED',
+      result.version,
+      result.contentHash,
+    );
+  }
+
+  /**
+   * Read but not applied (an apply error or a gap): send the FAILED ack with
+   * the reason first, then ack the message, so a crash in between redelivers
+   * it instead of losing the failure. Never nack it — the FAILED ack is the
+   * report. Only if that ack can't be sent is the message nacked, so RabbitMQ
+   * dead-letters it and head office still sees a failure.
+   */
+  private async reportFailure(
+    message: SyncMessage,
+    reason: string,
+    channel: Channel,
+    rawMessage: Message,
+  ): Promise<void> {
+    try {
       await this.sendAck(
         message.datasetType,
         message.version,
@@ -83,26 +110,33 @@ export class DataSyncController {
         message.contentHash,
         reason,
       );
+      channel.ack(rawMessage);
+    } catch (error) {
+      this.logger.error(
+        `Could not send FAILED ack for ${message.datasetType} v${message.version}, dead-lettering instead: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      channel.nack(rawMessage, false, false); // requeue=false → dead-letter exchange
     }
   }
 
   /**
-   * APPLIED is sent after the message is already acked, so a publish failure
-   * must not fall into the FAILED path (that would nack an acked message and
-   * report a healthy store as failed). A lost ack is recoverable: the next
-   * redelivery of the same version re-confirms it via the skip path.
+   * APPLIED and SKIPPED are sent after the message is already acked, so a
+   * publish failure must not fall into the FAILED path (that would report a
+   * healthy store as failed). A lost ack is recoverable: the next redelivery
+   * of the same version re-confirms it via the skip path.
    */
-  private async confirmApplied(
+  private async confirm(
     datasetType: string,
+    status: 'APPLIED' | 'SKIPPED',
     version: number,
     contentHash?: string,
   ): Promise<void> {
     try {
-      await this.sendAck(datasetType, version, 'APPLIED', contentHash);
+      await this.sendAck(datasetType, version, status, contentHash);
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       this.logger.warn(
-        `Could not send APPLIED ack for ${datasetType} v${version}: ${reason}`,
+        `Could not send ${status} ack for ${datasetType} v${version}: ${reason}`,
       );
     }
   }
